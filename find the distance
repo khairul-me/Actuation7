@@ -1,0 +1,108 @@
+# -*- coding: utf-8 -*-
+"""
+A script to capture aligned color and depth frames from an Intel RealSense camera,
+measure the distance to a specific pixel, and display the result.
+"""
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+
+# --------------------------
+# -- CONFIGURATION SETTINGS --
+# --------------------------
+
+# Stream resolutions
+DEPTH_WIDTH = 1024
+DEPTH_HEIGHT = 768
+COLOR_WIDTH = 1920
+COLOR_HEIGHT = 1080
+FRAME_RATE = 30
+
+# Pixel to measure distance from (center of the color frame)
+# Note: In NumPy, the order is (row, column) which corresponds to (y, x)
+PIXEL_Y = COLOR_HEIGHT // 2
+PIXEL_X = COLOR_WIDTH // 2
+
+
+# --------------------------
+# -- MAIN EXECUTION --
+# --------------------------
+
+# Initialize the pipeline and configuration
+pipeline = rs.pipeline()
+config = rs.config()
+
+# Enable the streams with the specified configurations
+config.enable_stream(rs.stream.depth, DEPTH_WIDTH, DEPTH_HEIGHT, rs.format.z16, FRAME_RATE)
+config.enable_stream(rs.stream.color, COLOR_WIDTH, COLOR_HEIGHT, rs.format.bgr8, FRAME_RATE)
+
+# The try/finally block ensures that the pipeline is stopped correctly
+try:
+    # --- 1. Start the pipeline ---
+    print("Starting RealSense pipeline...")
+    profile = pipeline.start(config)
+
+    # --- 2. Create an alignment object ---
+    # The align object maps depth pixels to color pixels
+    align_to = rs.stream.color
+    align = rs.align(align_to)
+
+    # --- 3. Get the depth scale ---
+    # This is used to convert the raw depth values (integers) to meters
+    depth_sensor = profile.get_device().first_depth_sensor()
+    depth_scale = depth_sensor.get_depth_scale()
+    print(f"Depth Scale is: {depth_scale}")
+
+    # --- 4. Wait for and process frames ---
+    print("Waiting for frames...")
+    # wait_for_frames() blocks until a coherent set of frames is available
+    frames = pipeline.wait_for_frames()
+
+    # Align the depth frame to the color frame to ensure pixel correspondence
+    aligned_frames = align.process(frames)
+
+    aligned_depth_frame = aligned_frames.get_depth_frame()
+    color_frame = aligned_frames.get_color_frame()
+
+    # Validate that both frames were successfully received
+    if not aligned_depth_frame or not color_frame:
+        raise RuntimeError("Could not acquire aligned color and depth frames.")
+
+    # --- 5. Convert images to NumPy arrays ---
+    depth_image = np.asanyarray(aligned_depth_frame.get_data())
+    color_image = np.asanyarray(color_frame.get_data())
+
+    # --- 6. Perform the distance measurement ---
+    depth_in_units = depth_image[PIXEL_Y, PIXEL_X]
+    distance_in_meters = depth_in_units * depth_scale
+
+    print(f"Distance to pixel ({PIXEL_X}, {PIXEL_Y}): {distance_in_meters:.3f} meters")
+
+    # --- 7. Prepare images for visualization ---
+    # Convert BGR image to RGB for Matplotlib
+    color_image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+
+    # Draw a circle at the measurement point
+    cv2.circle(color_image_rgb, (PIXEL_X, PIXEL_Y), 8, (255, 0, 0), -1)
+
+    # Create the text for annotation
+    distance_text = f"{distance_in_meters * 100:.2f} cm"
+
+    # --- 8. Display the annotated image ---
+    plt.figure(figsize=(12, 7))
+    plt.imshow(color_image_rgb)
+    plt.title("Object Distance Measurement")
+
+    # Add the distance text to the plot with a background for readability
+    plt.text(PIXEL_X + 15, PIXEL_Y + 5, distance_text, color="white", fontsize=12,
+             bbox=dict(facecolor='black', alpha=0.6, boxstyle='round,pad=0.3'))
+
+    plt.axis('off')  # Hide axes for a cleaner look
+    plt.show()
+
+finally:
+    # --- 9. Stop the pipeline ---
+    # This is crucial to release the camera resource
+    print("Stopping RealSense pipeline.")
+    pipeline.stop()
