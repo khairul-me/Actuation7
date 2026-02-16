@@ -1,0 +1,44 @@
+# Stage 3: Multi-View Geometric Refinement
+# Prerequisite: Real data fine-tuning complete
+
+model:
+  num_layers: 3
+  d_model: 256
+  num_heads: 8
+  dropout: 0.1
+  use_foundation_fusion: true
+  use_dino: true
+  use_depth_anything: true
+  use_multiview: true
+
+loss:
+  alpha_composite: 1.0
+  alpha_order: 0.1
+  alpha_alpha: 0.5
+  alpha_thin: 0.3
+  alpha_consistency: 0.5
+
+training:
+  epochs: 20
+  batch_size: 2  # Smaller batch for dual-view
+  lr: 2.0e-5
+  weight_decay: 1.0e-5
+  scheduler: cosine
+  warmup_epochs: 2
+  grad_clip: 1.0
+  pretrained: checkpoints/real_best.pth
+
+data:
+  data_dir: data/real/agricultural
+  image_size: [480, 848]
+  max_depth: 1.0
+  num_workers: 4
+  mode: dual
+
+logging:
+  use_wandb: true
+  project: layered-depth-refinement
+  experiment: multiview_train
+  log_interval: 10
+  save_interval: 5
+
