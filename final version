@@ -1,0 +1,869 @@
+# -*- coding: utf-8 -*-
+#Final code
+"""
+A script for REAL-TIME LIVE FEED from Intel RealSense camera
+with color segmentation, point cloud generation, and ASPARAGUS LENGTH MEASUREMENT.
+(Version 22: Debugged length measurement with better error handling)
+"""
+
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+import time
+import threading
+from collections import deque
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+# Try importing the required libraries for length measurement
+try:
+    import open3d as o3d
+    OPEN3D_AVAILABLE = True
+except ImportError:
+    print("⚠️ Open3D not installed. Length measurement will be disabled.")
+    print("   Install with: pip install open3d")
+    OPEN3D_AVAILABLE = False
+
+try:
+    from skimage.morphology import skeletonize_3d
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    print("⚠️ scikit-image not installed. Length measurement will be disabled.")
+    print("   Install with: pip install scikit-image")
+    SKIMAGE_AVAILABLE = False
+
+try:
+    from scipy.spatial import cKDTree
+    from scipy.interpolate import splprep, splev
+    from scipy.integrate import simps
+    SCIPY_AVAILABLE = True
+except ImportError:
+    print("⚠️ scipy not installed. Length measurement will be disabled.")
+    print("   Install with: pip install scipy")
+    SCIPY_AVAILABLE = False
+
+try:
+    import networkx as nx
+    NETWORKX_AVAILABLE = True
+except ImportError:
+    print("⚠️ NetworkX not installed. Length measurement will be disabled.")
+    print("   Install with: pip install networkx")
+    NETWORKX_AVAILABLE = False
+
+# Check if all dependencies are available
+LENGTH_MEASUREMENT_AVAILABLE = (OPEN3D_AVAILABLE and SKIMAGE_AVAILABLE and
+                               SCIPY_AVAILABLE and NETWORKX_AVAILABLE)
+
+if LENGTH_MEASUREMENT_AVAILABLE:
+    print("✅ All dependencies for length measurement are available!")
+else:
+    print("❌ Some dependencies are missing. Length measurement disabled.")
+
+# ---------------------------------
+# -- CONFIGURATION --
+# ---------------------------------
+
+# -- Stream settings
+DEPTH_WIDTH = 1024
+DEPTH_HEIGHT = 768
+COLOR_WIDTH = 1920
+COLOR_HEIGHT = 1080
+FRAME_RATE = 30
+
+# -- Cropping settings
+CROP_PERCENT_X = 10 # Crop from left and right
+CROP_PERCENT_Y = 10 # Crop from top and bottom
+
+# -- Color Segmentation (HSV Range for Green) --
+LOWER_GREEN_1 = np.array([35, 20, 20])
+UPPER_GREEN_1 = np.array([85, 255, 255])
+LOWER_GREEN_2 = np.array([20, 20, 20])
+UPPER_GREEN_2 = np.array([34, 255, 255])
+
+# -- Point Cloud settings
+DEPTH_SCALE = 0.001  # Convert mm to meters (standard for RealSense)
+MIN_DEPTH = 0.1      # Minimum depth in meters
+MAX_DEPTH = 3.0      # Maximum depth in meters
+POINT_CLOUD_DOWNSAMPLE = 2  # Reduced from 3 to get more points
+
+# -- Length Calibration
+# Based on your actual measurement: 19cm actual vs ~70cm measured
+# This gives us a calibration factor of 19/70 ≈ 0.27
+LENGTH_CALIBRATION_FACTOR = 0.27  # Multiply all lengths by this factor
+
+# -- Length Measurement settings
+VOXEL_SIZE = 0.003  # Reduced from 4mm to 3mm for better resolution
+DBSCAN_EPS = 0.008  # Increased from 5mm to 8mm for better clustering
+DBSCAN_MIN_POINTS = 30  # Reduced from 50 to handle smaller point clouds
+SKELETON_NEIGHBOR_RADIUS_FACTOR = 2.0  # Increased from 1.75
+SPLINE_SMOOTHING = 0.001  # B-spline smoothing factor
+SPLINE_SAMPLES = 800  # Number of samples for arc length calculation
+MIN_POINTS_FOR_LENGTH = 50  # Minimum points needed for measurement
+
+# -- Display settings
+DISPLAY_SCALE = 0.6  # Scale factor for display windows
+WINDOW_NAMES = ['Live Feed', 'HSV Space', 'Color Mask', 'Segmented']
+
+# -- Debug mode
+DEBUG_LENGTH_MEASUREMENT = True  # Set to True for detailed debugging output
+
+# ---------------------------------
+# -- GLOBAL VARIABLES --
+# ---------------------------------
+pipeline = None
+align = None
+depth_intrinsics = None
+fps_counter = deque(maxlen=30)
+point_cloud_stats = {}
+asparagus_length = 0.0  # Measured length in cm
+length_debug_info = ""  # Debug information string
+
+# Matplotlib figure for 3D point cloud
+fig_3d = None
+ax_3d = None
+canvas_3d = None
+
+# ---------------------------------
+# -- CAMERA INITIALIZATION --
+# ---------------------------------
+
+def initialize_camera():
+    """Initialize RealSense camera pipeline"""
+    global pipeline, align, depth_intrinsics
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+
+    config.enable_stream(rs.stream.depth, DEPTH_WIDTH, DEPTH_HEIGHT, rs.format.z16, FRAME_RATE)
+    config.enable_stream(rs.stream.color, COLOR_WIDTH, COLOR_HEIGHT, rs.format.bgr8, FRAME_RATE)
+
+    print("🎥 Starting RealSense pipeline...")
+    profile = pipeline.start(config)
+
+    # Get camera intrinsics
+    depth_profile = profile.get_stream(rs.stream.depth)
+    depth_intrinsics = depth_profile.as_video_stream_profile().get_intrinsics()
+
+    align = rs.align(rs.stream.color)
+
+    # Warm up camera
+    print("⏳ Warming up camera...")
+    for _ in range(30):
+        pipeline.wait_for_frames()
+
+    print("✅ Camera ready for live feed!")
+
+# ---------------------------------
+# -- SIMPLE LENGTH MEASUREMENT (FALLBACK) --
+# ---------------------------------
+
+def measure_length_simple(points_3d):
+    """
+    Simple fallback length measurement using PCA (Principal Component Analysis)
+    to find the main axis of the point cloud.
+    """
+    if len(points_3d) < 10:
+        return 0.0, np.array([])
+
+    # Center the points
+    centroid = np.mean(points_3d, axis=0)
+    centered_points = points_3d - centroid
+
+    # Compute PCA
+    cov_matrix = np.cov(centered_points.T)
+    eigenvalues, eigenvectors = np.linalg.eig(cov_matrix)
+
+    # Find principal axis (eigenvector with largest eigenvalue)
+    main_axis_idx = np.argmax(eigenvalues)
+    main_axis = eigenvectors[:, main_axis_idx]
+
+    # Project points onto main axis
+    projections = np.dot(centered_points, main_axis)
+
+    # Find extent along main axis
+    min_proj = np.min(projections)
+    max_proj = np.max(projections)
+
+    # Length is the extent along main axis
+    length = max_proj - min_proj
+    length_cm = length * 100.0 * LENGTH_CALIBRATION_FACTOR  # Convert to cm WITH CALIBRATION
+
+    # Create simple centerline (just endpoints along main axis)
+    start_point = centroid + min_proj * main_axis
+    end_point = centroid + max_proj * main_axis
+    centerline = np.array([start_point, end_point])
+
+    return length_cm, centerline
+
+# ---------------------------------
+# -- LENGTH MEASUREMENT FUNCTIONS --
+# ---------------------------------
+
+def measure_asparagus_length(points_3d):
+    """
+    Measure the length of asparagus from 3D point cloud using skeletonization.
+    With extensive debugging and fallback options.
+    """
+    global length_debug_info
+
+    if not LENGTH_MEASUREMENT_AVAILABLE:
+        # Use simple fallback method
+        return measure_length_simple(points_3d)
+
+    if len(points_3d) < MIN_POINTS_FOR_LENGTH:
+        length_debug_info = f"Too few points: {len(points_3d)} < {MIN_POINTS_FOR_LENGTH}"
+        return 0.0, np.array([])
+
+    try:
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"\n📏 Starting length measurement with {len(points_3d)} points")
+
+        # Step 1: Clean point cloud using DBSCAN clustering
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points_3d)
+
+        # Perform DBSCAN clustering
+        labels = np.array(pcd.cluster_dbscan(eps=DBSCAN_EPS, min_points=DBSCAN_MIN_POINTS))
+
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"   DBSCAN found {len(np.unique(labels[labels >= 0]))} clusters")
+
+        if len(labels) == 0 or np.all(labels == -1):
+            length_debug_info = "DBSCAN: No clusters found"
+            # Fallback to simple method
+            return measure_length_simple(points_3d)
+
+        # Keep only the largest cluster
+        unique_labels = labels[labels >= 0]
+        if len(unique_labels) == 0:
+            length_debug_info = "DBSCAN: Only noise points"
+            return measure_length_simple(points_3d)
+
+        largest_cluster = np.argmax(np.bincount(unique_labels))
+        cluster_mask = labels == largest_cluster
+        cleaned_points = points_3d[cluster_mask]
+
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"   Largest cluster has {len(cleaned_points)} points")
+
+        if len(cleaned_points) < MIN_POINTS_FOR_LENGTH:
+            length_debug_info = f"Cluster too small: {len(cleaned_points)} points"
+            return measure_length_simple(cleaned_points)
+
+        # Step 2: Voxelize the point cloud
+        pts = cleaned_points
+        mn = pts.min(axis=0)
+        mx = pts.max(axis=0)
+
+        # Calculate grid dimensions
+        grid_size = np.ceil((mx - mn) / VOXEL_SIZE).astype(int) + 1  # Add 1 for safety
+
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"   Voxel grid size: {grid_size}")
+            print(f"   Bounding box: {mx - mn} meters")
+
+        # Safety check for grid size
+        if np.any(grid_size > 300) or np.any(grid_size <= 0):
+            length_debug_info = f"Invalid grid size: {grid_size}"
+            return measure_length_simple(cleaned_points)
+
+        # Create voxel grid
+        grid_idx = np.floor((pts - mn) / VOXEL_SIZE).astype(int)
+
+        # Ensure indices are within bounds
+        for i in range(3):
+            grid_idx[:, i] = np.clip(grid_idx[:, i], 0, grid_size[i] - 1)
+
+        # Create binary volume
+        vol = np.zeros(tuple(grid_size), dtype=np.uint8)
+        vol[grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]] = 1
+
+        filled_voxels = np.sum(vol)
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"   Filled voxels: {filled_voxels}")
+
+        if filled_voxels < 5:
+            length_debug_info = f"Too few voxels: {filled_voxels}"
+            return measure_length_simple(cleaned_points)
+
+        # Step 3: Apply 3D skeletonization
+        skeleton = skeletonize_3d(vol).astype(bool)
+
+        # Get skeleton points
+        sk_coords = np.argwhere(skeleton)
+
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"   Skeleton points: {len(sk_coords)}")
+
+        if len(sk_coords) < 2:
+            length_debug_info = "Skeletonization failed"
+            return measure_length_simple(cleaned_points)
+
+        # Convert back to world coordinates
+        sk_pts = sk_coords * VOXEL_SIZE + mn
+
+        # Step 4: Build graph from skeleton
+        if len(sk_pts) == 2:
+            # Simple case: just two points
+            length = np.linalg.norm(sk_pts[1] - sk_pts[0])
+            return length * 100.0, sk_pts
+
+        tree = cKDTree(sk_pts)
+        radius = SKELETON_NEIGHBOR_RADIUS_FACTOR * VOXEL_SIZE
+        neighbors = tree.query_ball_point(sk_pts, r=radius)
+
+        # Create graph
+        G = nx.Graph()
+        for i, nbrs in enumerate(neighbors):
+            for j in nbrs:
+                if i != j:
+                    dist = np.linalg.norm(sk_pts[i] - sk_pts[j])
+                    G.add_edge(i, j, weight=dist)
+
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"   Graph nodes: {len(G.nodes())}, edges: {len(G.edges())}")
+
+        if len(G.nodes()) < 2:
+            length_debug_info = "Graph construction failed"
+            return measure_length_simple(cleaned_points)
+
+        # Ensure graph is connected
+        if not nx.is_connected(G):
+            # Get largest connected component
+            largest_cc = max(nx.connected_components(G), key=len)
+            G = G.subgraph(largest_cc).copy()
+            if DEBUG_LENGTH_MEASUREMENT:
+                print(f"   Using largest connected component: {len(G.nodes())} nodes")
+
+        # Step 5: Find main path (longest shortest path)
+        # Find endpoints (degree 1 nodes)
+        degrees = dict(G.degree())
+        endpoints = [node for node, deg in degrees.items() if deg == 1]
+
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"   Found {len(endpoints)} endpoints")
+
+        if len(endpoints) < 2:
+            # If no clear endpoints, use farthest points
+            if len(G.nodes()) > 0:
+                # Pick arbitrary starting point
+                nodes_list = list(G.nodes())
+                start_node = nodes_list[0]
+                try:
+                    lengths = nx.single_source_dijkstra_path_length(G, start_node)
+                    if lengths:
+                        endpoints = [start_node, max(lengths, key=lengths.get)]
+                    else:
+                        length_debug_info = "No path lengths found"
+                        return measure_length_simple(cleaned_points)
+                except:
+                    length_debug_info = "Path finding failed"
+                    return measure_length_simple(cleaned_points)
+            else:
+                length_debug_info = "No graph nodes"
+                return measure_length_simple(cleaned_points)
+
+        # Find longest path between endpoints
+        best_path = None
+        max_length = 0
+
+        for i, endpoint_a in enumerate(endpoints[:min(10, len(endpoints))]):  # Limit search
+            try:
+                distances = nx.single_source_dijkstra_path_length(G, endpoint_a)
+                if distances:
+                    farthest = max(distances, key=distances.get)
+                    if distances[farthest] > max_length:
+                        max_length = distances[farthest]
+                        best_path = nx.shortest_path(G, endpoint_a, farthest, weight='weight')
+            except:
+                continue
+
+        if best_path is None or len(best_path) < 2:
+            length_debug_info = "No valid path found"
+            return measure_length_simple(cleaned_points)
+
+        # Get centerline points
+        centerline = sk_pts[best_path]
+
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"   Path length: {len(best_path)} nodes")
+
+        # Step 6: Calculate length
+        if len(centerline) < 4:  # Need at least 4 points for cubic spline
+            # Fall back to simple distance sum
+            length = np.sum(np.linalg.norm(np.diff(centerline, axis=0), axis=1))
+            length_debug_info = f"Simple sum: {len(centerline)} points"
+            return length * 100.0, centerline
+
+        try:
+            # Fit parametric spline
+            tck, u = splprep([centerline[:, 0], centerline[:, 1], centerline[:, 2]],
+                           s=SPLINE_SMOOTHING, k=min(3, len(centerline)-1))
+
+            # Sample spline at many points
+            uu = np.linspace(0, 1, SPLINE_SAMPLES)
+
+            # Calculate derivatives (velocity)
+            dx, dy, dz = splev(uu, tck, der=1)
+
+            # Calculate speed at each point
+            speed = np.sqrt(dx**2 + dy**2 + dz**2)
+
+            # Integrate to get arc length
+            length = simps(speed, uu)
+            length_cm = 100.0 * length * LENGTH_CALIBRATION_FACTOR  # Convert to cm with calibration
+
+            length_debug_info = f"Success: {length_cm:.1f}cm"
+            if DEBUG_LENGTH_MEASUREMENT:
+                print(f"   ✅ Measured length: {length_cm:.1f} cm")
+
+            return length_cm, centerline
+
+        except Exception as e:
+            # If spline fitting fails, use simple sum
+            length = np.sum(np.linalg.norm(np.diff(centerline, axis=0), axis=1))
+            length_debug_info = f"Spline failed, using sum"
+            return length * 100.0 * LENGTH_CALIBRATION_FACTOR, centerline
+
+    except Exception as e:
+        length_debug_info = f"Error: {str(e)[:30]}"
+        if DEBUG_LENGTH_MEASUREMENT:
+            print(f"❌ Length measurement error: {e}")
+        return measure_length_simple(points_3d)
+
+# ---------------------------------
+# -- PROCESSING FUNCTIONS --
+# ---------------------------------
+
+def generate_point_cloud_fast(depth_image, mask, color_image, crop_offset_x, crop_offset_y):
+    """Fast point cloud generation for real-time processing"""
+    global depth_intrinsics, point_cloud_stats, asparagus_length
+
+    # Downsample for speed
+    h, w = depth_image.shape
+    y_coords, x_coords = np.mgrid[0:h:POINT_CLOUD_DOWNSAMPLE, 0:w:POINT_CLOUD_DOWNSAMPLE]
+
+    # Get downsampled arrays
+    depth_ds = depth_image[::POINT_CLOUD_DOWNSAMPLE, ::POINT_CLOUD_DOWNSAMPLE]
+    mask_ds = mask[::POINT_CLOUD_DOWNSAMPLE, ::POINT_CLOUD_DOWNSAMPLE]
+    color_ds = color_image[::POINT_CLOUD_DOWNSAMPLE, ::POINT_CLOUD_DOWNSAMPLE]
+
+    # Convert depth to meters
+    depth_meters = depth_ds * DEPTH_SCALE
+
+    # Filter valid points
+    valid_mask = (depth_meters > MIN_DEPTH) & (depth_meters < MAX_DEPTH) & (depth_meters > 0) & (mask_ds > 0)
+
+    if not np.any(valid_mask):
+        point_cloud_stats = {'count': 0, 'bounds': None}
+        asparagus_length = 0.0
+        return np.array([]), np.array([]), np.array([])
+
+    # Get valid coordinates
+    valid_points = np.where(valid_mask)
+    num_points = len(valid_points[0])
+
+    # Calculate 3D points and colors (vectorized for speed)
+    points_3d = []
+    colors_3d = []
+
+    for i in range(num_points):
+        y_idx, x_idx = valid_points[0][i], valid_points[1][i]
+
+        # Original pixel coordinates
+        pixel_x = x_idx * POINT_CLOUD_DOWNSAMPLE + crop_offset_x
+        pixel_y = y_idx * POINT_CLOUD_DOWNSAMPLE + crop_offset_y
+        depth_val = depth_meters[y_idx, x_idx]
+
+        # Deproject to 3D
+        point_3d = rs.rs2_deproject_pixel_to_point(depth_intrinsics, [pixel_x, pixel_y], depth_val)
+        points_3d.append(point_3d)
+
+        # Get corresponding color (BGR to RGB, normalized)
+        color_bgr = color_ds[y_idx, x_idx]
+        color_rgb = [color_bgr[2]/255.0, color_bgr[1]/255.0, color_bgr[0]/255.0]
+        colors_3d.append(color_rgb)
+
+    points_3d = np.array(points_3d)
+    colors_3d = np.array(colors_3d)
+
+    # Measure asparagus length
+    length_cm, centerline = measure_asparagus_length(points_3d)
+    asparagus_length = length_cm
+
+    # Update statistics
+    if len(points_3d) > 0:
+        point_cloud_stats = {
+            'count': len(points_3d),
+            'length_cm': length_cm,
+            'bounds': {
+                'x': (points_3d[:, 0].min(), points_3d[:, 0].max()),
+                'y': (points_3d[:, 1].min(), points_3d[:, 1].max()),
+                'z': (points_3d[:, 2].min(), points_3d[:, 2].max())
+            }
+        }
+
+    return points_3d, colors_3d, centerline
+
+def process_frame_live():
+    """Process single frame for live display"""
+    global pipeline, align, fps_counter
+
+    try:
+        frame_start = time.time()
+
+        # Get frames with short timeout for responsiveness
+        frames = pipeline.wait_for_frames(timeout_ms=100)
+        aligned_frames = align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
+        depth_frame = aligned_frames.get_depth_frame()
+
+        if not color_frame or not depth_frame:
+            return None
+
+        # Convert to numpy
+        color_image_full = np.asanyarray(color_frame.get_data())
+        depth_image_full = np.asanyarray(depth_frame.get_data())
+
+        # Apply cropping
+        crop_x = int(color_image_full.shape[1] * (CROP_PERCENT_X / 100))
+        crop_y = int(color_image_full.shape[0] * (CROP_PERCENT_Y / 100))
+
+        color_image = color_image_full[crop_y:-crop_y, crop_x:-crop_x]
+        depth_image = depth_image_full[crop_y:-crop_y, crop_x:-crop_x]
+
+        # HSV conversion and segmentation
+        hsv_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2HSV)
+
+        # Create masks
+        mask1 = cv2.inRange(hsv_image, LOWER_GREEN_1, UPPER_GREEN_1)
+        mask2 = cv2.inRange(hsv_image, LOWER_GREEN_2, UPPER_GREEN_2)
+        color_mask = cv2.bitwise_or(mask1, mask2)
+
+        # Morphological operations
+        kernel = np.ones((11, 11), np.uint8)
+        cleaned_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+        cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel)
+
+        # Find and fill largest contour
+        contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filled_mask = np.zeros_like(cleaned_mask)
+
+        color_with_bbox = color_image.copy()
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_contour) > 100:
+                cv2.drawContours(filled_mask, [largest_contour], 0, 255, -1)
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                cv2.rectangle(color_with_bbox, (x, y), (x + w, y + h), (0, 255, 0), 3)
+
+                # Add area text
+                area = cv2.contourArea(largest_contour)
+                cv2.putText(color_with_bbox, f'Area: {int(area)}px', (x, y-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # Create segmented image
+        segmented_image = cv2.bitwise_and(color_image, color_image, mask=filled_mask)
+
+        # Generate point cloud with length measurement
+        points_3d, colors_3d, centerline = generate_point_cloud_fast(
+            depth_image, filled_mask, color_image, crop_x, crop_y)
+
+        # Calculate FPS
+        frame_time = time.time() - frame_start
+        fps = 1.0 / frame_time if frame_time > 0 else 0
+        fps_counter.append(fps)
+        avg_fps = np.mean(fps_counter)
+
+        # Add overlay information to main image
+        cv2.putText(color_with_bbox, f'FPS: {avg_fps:.1f}', (20, 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+        cv2.putText(color_with_bbox, f'Points: {point_cloud_stats.get("count", 0)}', (20, 80),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+
+        # Add LENGTH measurement
+        length_text = f'Length: {asparagus_length:.1f} cm'
+        cv2.putText(color_with_bbox, length_text, (20, 120),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+
+        # Add debug info if in debug mode
+        if DEBUG_LENGTH_MEASUREMENT and length_debug_info:
+            cv2.putText(color_with_bbox, f'Debug: {length_debug_info}', (20, 160),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 128, 0), 1)
+
+        return {
+            'color': color_with_bbox,
+            'hsv': hsv_image,
+            'mask': cv2.cvtColor(filled_mask, cv2.COLOR_GRAY2BGR),
+            'segmented': segmented_image,
+            'fps': avg_fps,
+            'points_3d': points_3d,
+            'colors_3d': colors_3d,
+            'centerline': centerline
+        }
+
+    except Exception as e:
+        print(f"⚠️  Frame processing error: {e}")
+        return None
+
+def setup_3d_matplotlib():
+    """Setup matplotlib 3D figure for point cloud visualization"""
+    global fig_3d, ax_3d, canvas_3d
+
+    # Create matplotlib figure
+    plt.ioff()  # Turn off interactive mode for this figure
+    fig_3d = plt.figure(figsize=(8, 6))
+    ax_3d = fig_3d.add_subplot(111, projection='3d')
+
+    # Set labels and title
+    ax_3d.set_xlabel('X (m)')
+    ax_3d.set_ylabel('Y (m)')
+    ax_3d.set_zlabel('Z (m)')
+    ax_3d.set_title('Asparagus Point Cloud\n(Camera Coordinates)')
+
+    # Create canvas
+    canvas_3d = FigureCanvasAgg(fig_3d)
+
+    return fig_3d, ax_3d, canvas_3d
+
+def create_3d_pointcloud_image(points_3d, colors_3d, centerline=None):
+    """Create 3D point cloud visualization with centerline as OpenCV image"""
+    global fig_3d, ax_3d, canvas_3d
+
+    if fig_3d is None:
+        setup_3d_matplotlib()
+
+    # Clear previous plot
+    ax_3d.clear()
+
+    # Set labels and title again
+    ax_3d.set_xlabel('X (m)')
+    ax_3d.set_ylabel('Y (m)')
+    ax_3d.set_zlabel('Z (m)')
+    ax_3d.set_title('Asparagus Point Cloud with Centerline\n(Camera Coordinates)')
+
+    if len(points_3d) > 0:
+        # Plot point cloud
+        ax_3d.scatter(points_3d[:, 0], points_3d[:, 1], points_3d[:, 2],
+                     c=colors_3d, s=2, alpha=0.6)
+
+        # Plot centerline if available
+        if centerline is not None and len(centerline) > 1:
+            ax_3d.plot(centerline[:, 0], centerline[:, 1], centerline[:, 2],
+                      'r-', linewidth=3, label=f'Centerline ({asparagus_length:.1f}cm)')
+            ax_3d.scatter(centerline[0, 0], centerline[0, 1], centerline[0, 2],
+                         c='yellow', s=50, marker='o', label='Start')
+            ax_3d.scatter(centerline[-1, 0], centerline[-1, 1], centerline[-1, 2],
+                         c='orange', s=50, marker='o', label='End')
+            ax_3d.legend(loc='upper right')
+
+        # Set equal aspect ratio for better visualization
+        max_range = np.array([points_3d[:,0].max()-points_3d[:,0].min(),
+                             points_3d[:,1].max()-points_3d[:,1].min(),
+                             points_3d[:,2].max()-points_3d[:,2].min()]).max() / 2.0
+        mid_x = (points_3d[:,0].max()+points_3d[:,0].min()) * 0.5
+        mid_y = (points_3d[:,1].max()+points_3d[:,1].min()) * 0.5
+        mid_z = (points_3d[:,2].max()+points_3d[:,2].min()) * 0.5
+
+        ax_3d.set_xlim(mid_x - max_range, mid_x + max_range)
+        ax_3d.set_ylim(mid_y - max_range, mid_y + max_range)
+        ax_3d.set_zlim(mid_z - max_range, mid_z + max_range)
+
+        # Add statistics text with LENGTH
+        stats_text = f'Point Count: {len(points_3d)}\n'
+        stats_text += f'Length: {asparagus_length:.1f} cm\n'
+        stats_text += f'X: {points_3d[:, 0].min():.3f} to {points_3d[:, 0].max():.3f} m\n'
+        stats_text += f'Y: {points_3d[:, 1].min():.3f} to {points_3d[:, 1].max():.3f} m\n'
+        stats_text += f'Z: {points_3d[:, 2].min():.3f} to {points_3d[:, 2].max():.3f} m'
+
+        ax_3d.text2D(0.02, 0.98, stats_text, transform=ax_3d.transAxes,
+                    verticalalignment='top', fontsize=8,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    else:
+        # Show "No data" message
+        ax_3d.text(0.5, 0.5, 0.5, 'No point cloud data',
+                  horizontalalignment='center', verticalalignment='center',
+                  transform=ax_3d.transAxes, fontsize=12)
+
+    # Set dark background
+    ax_3d.xaxis.pane.fill = False
+    ax_3d.yaxis.pane.fill = False
+    ax_3d.zaxis.pane.fill = False
+    ax_3d.xaxis.pane.set_edgecolor('gray')
+    ax_3d.yaxis.pane.set_edgecolor('gray')
+    ax_3d.zaxis.pane.set_edgecolor('gray')
+    ax_3d.grid(True, alpha=0.3)
+
+    # Render to image
+    canvas_3d.draw()
+
+    # Convert to OpenCV format
+    buf = np.frombuffer(canvas_3d.tostring_rgb(), dtype=np.uint8)
+    buf = buf.reshape(canvas_3d.get_width_height()[::-1] + (3,))
+
+    # Convert RGB to BGR for OpenCV
+    img_bgr = cv2.cvtColor(buf, cv2.COLOR_RGB2BGR)
+
+    return img_bgr
+
+def setup_display_windows():
+    """Setup OpenCV display windows"""
+    for name in WINDOW_NAMES:
+        cv2.namedWindow(name, cv2.WINDOW_AUTOSIZE)
+
+    # Add the 3D point cloud window
+    cv2.namedWindow('3D Point Cloud', cv2.WINDOW_AUTOSIZE)
+
+    # Arrange windows
+    window_positions = [
+        (0, 0),      # Live Feed
+        (700, 0),    # HSV Space
+        (0, 500),    # Color Mask
+        (700, 500),  # Segmented
+        (1400, 0)    # 3D Point Cloud
+    ]
+
+    window_names_with_3d = WINDOW_NAMES + ['3D Point Cloud']
+    for name, pos in zip(window_names_with_3d, window_positions):
+        cv2.moveWindow(name, pos[0], pos[1])
+
+# ---------------------------------
+# -- MAIN LIVE FEED LOOP --
+# ---------------------------------
+
+def main():
+    """Main real-time live feed loop with length measurement"""
+    global pipeline, LENGTH_CALIBRATION_FACTOR
+
+    try:
+        # Initialize camera
+        initialize_camera()
+
+        # Setup display windows
+        setup_display_windows()
+
+        print("🚀 Starting LIVE FEED with LENGTH MEASUREMENT...")
+        if LENGTH_MEASUREMENT_AVAILABLE:
+            print("📏 Full skeletonization-based length measurement enabled")
+        else:
+            print("📏 Using simple PCA-based length measurement (install missing libraries for full features)")
+        print("📺 Multiple windows will show different processing stages")
+        print("⏹️  Press 'q' in any window or ESC to quit")
+        print("🔄 Press 'r' to reset statistics")
+        print("📸 Press 's' to save current measurement")
+        print("🎯 Press 'c' to calibrate (place a known length object)")
+        if DEBUG_LENGTH_MEASUREMENT:
+            print("🔍 Debug mode is ON - check console for details")
+        print(f"⚙️  Current calibration factor: {LENGTH_CALIBRATION_FACTOR:.3f}")
+
+        frame_count = 0
+        saved_measurements = []
+        calibration_mode = False
+        known_length = 19.0  # cm - default known length for calibration
+
+        while True:
+            # Process frame
+            result = process_frame_live()
+
+            if result is not None:
+                frame_count += 1
+
+                # Resize images for display
+                scale = DISPLAY_SCALE
+
+                # Show live feed with length overlay
+                color_resized = cv2.resize(result['color'], None, fx=scale, fy=scale)
+
+                # Add calibration mode indicator
+                if calibration_mode:
+                    cv2.putText(color_resized, "CALIBRATION MODE - Press Enter when ready", (20, 200),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                cv2.imshow('Live Feed', color_resized)
+
+                # Show HSV
+                hsv_resized = cv2.resize(result['hsv'], None, fx=scale, fy=scale)
+                cv2.imshow('HSV Space', hsv_resized)
+
+                # Show mask
+                mask_resized = cv2.resize(result['mask'], None, fx=scale, fy=scale)
+                cv2.imshow('Color Mask', mask_resized)
+
+                # Show segmented
+                segmented_resized = cv2.resize(result['segmented'], None, fx=scale, fy=scale)
+                cv2.imshow('Segmented', segmented_resized)
+
+                # Create and show 3D point cloud visualization with centerline
+                if len(result['points_3d']) > 0:
+                    pointcloud_img = create_3d_pointcloud_image(
+                        result['points_3d'],
+                        result['colors_3d'],
+                        result.get('centerline', None))
+                    cv2.imshow('3D Point Cloud', pointcloud_img)
+                else:
+                    # Show empty point cloud
+                    pointcloud_img = create_3d_pointcloud_image(np.array([]), np.array([]))
+                    cv2.imshow('3D Point Cloud', pointcloud_img)
+
+                # Print periodic updates with length
+                if frame_count % 100 == 0:
+                    print(f"📊 Frame {frame_count}: {result['fps']:.1f} FPS, "
+                          f"{point_cloud_stats.get('count', 0)} points, "
+                          f"Length: {asparagus_length:.1f} cm")
+
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:  # 'q' or ESC
+                print("🛑 Quitting live feed...")
+                break
+            elif key == ord('r'):  # Reset stats
+                fps_counter.clear()
+                point_cloud_stats.clear()
+                print("🔄 Statistics reset")
+            elif key == ord('s'):  # Save measurement
+                if asparagus_length > 0:
+                    saved_measurements.append(asparagus_length)
+                    print(f"📸 Saved measurement #{len(saved_measurements)}: {asparagus_length:.1f} cm")
+                    print(f"   Average of saved: {np.mean(saved_measurements):.1f} cm")
+            elif key == ord('c'):  # Start calibration mode
+                calibration_mode = True
+                print(f"🎯 Calibration mode activated!")
+                print(f"   Place an object of known length ({known_length} cm)")
+                print(f"   Press Enter when ready, or 'k' to change known length")
+            elif key == ord('k') and calibration_mode:  # Set known length
+                try:
+                    new_length = float(input("Enter known length in cm: "))
+                    known_length = new_length
+                    print(f"   Known length set to {known_length} cm")
+                except:
+                    print("   Invalid input, keeping previous value")
+            elif key == 13 and calibration_mode:  # Enter key - perform calibration
+                if asparagus_length > 0:
+                    raw_measurement = asparagus_length / LENGTH_CALIBRATION_FACTOR  # Get uncalibrated measurement
+                    LENGTH_CALIBRATION_FACTOR = known_length / raw_measurement
+                    print(f"✅ Calibration complete!")
+                    print(f"   Raw measurement: {raw_measurement:.1f} cm")
+                    print(f"   Known length: {known_length:.1f} cm")
+                    print(f"   New calibration factor: {LENGTH_CALIBRATION_FACTOR:.3f}")
+                    calibration_mode = False
+                else:
+                    print("❌ No object detected for calibration")
+
+    except KeyboardInterrupt:
+        print("\n⚠️  Keyboard interrupt received")
+    except Exception as e:
+        print(f"❌ Error in live feed: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup
+        if pipeline:
+            print("🔌 Stopping camera...")
+            pipeline.stop()
+        cv2.destroyAllWindows()
+        print("✅ Live feed stopped successfully")
+
+if __name__ == "__main__":
+    main()
